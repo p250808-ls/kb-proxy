@@ -186,6 +186,7 @@ async def save_chunks_to_supabase(doc_id: int, chunks: list[dict], embeddings: l
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
+        "Content-Profile": "kb",
         "Prefer": "return=minimal",
     }
     batch_size = 50
@@ -204,6 +205,7 @@ async def save_doc_index(filename: str, workspace_tags: list[str]) -> int:
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
+        "Content-Profile": "kb",
         "Prefer": "return=representation",
     }
     payload = {
@@ -227,6 +229,7 @@ async def vector_search(query_embedding: list[float], filter_tags: list[str]) ->
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
         "Content-Type": "application/json",
+        "Content-Profile": "kb",
     }
     payload = {
         "query_embedding": query_embedding,
