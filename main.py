@@ -1,6 +1,6 @@
 """
 行政法規知識庫系統 — 智慧入庫與查詢服務
-版本：2.0.0
+版本：2.1.0
 取代：AnythingLLM + 舊版 kb-proxy
 功能：
   POST /ingest  — PDF 解析、切 chunk、Cohere 嵌入、存 Supabase
@@ -17,7 +17,7 @@ from typing import Optional
 # ── PDF 解析 ──────────────────────────────────────────────
 import pdfplumber
 
-app = FastAPI(title="KB Service", version="2.0.0")
+app = FastAPI(title="KB Service", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,6 +49,10 @@ INTENT_TAG_MAP = {
     "OTHER":       "GENERAL",
 }
 
+DEFAULT_SYSTEM_PROMPT = """你是一位行政法規助理，請根據以下知識庫內容回答問題。
+請用繁體中文回答，條列重點，並在最後說明資料來源。
+若知識庫內容不足以完整回答，請說明不足之處並建議洽詢主管機關。"""
+
 # ════════════════════════════════════════════════════════════
 # 工具函數
 # ════════════════════════════════════════════════════════════
@@ -64,12 +68,12 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> list[dict]:
     return pages
 
 
-def chunk_text(pages: list[dict]) -> list[dict]:
+def chunk_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[dict]:
     """
     切 chunk：
     - 以段落為優先邊界
     - 保留 page_hint（來源頁碼）
-    - CHUNK_SIZE 字元，CHUNK_OVERLAP 字元重疊
+    - chunk_size 字元，chunk_overlap 字元重疊
     """
     chunks = []
     buffer = ""
@@ -85,14 +89,14 @@ def chunk_text(pages: list[dict]) -> list[dict]:
             if not para:
                 continue
 
-            if len(buffer) + len(para) > CHUNK_SIZE:
+            if len(buffer) + len(para) > chunk_size:
                 if buffer.strip():
                     chunks.append({
                         "text": buffer.strip(),
                         "page": current_page
                     })
                 # 保留 overlap
-                buffer = buffer[-CHUNK_OVERLAP:] + "\n" + para
+                buffer = buffer[-chunk_overlap:] + "\n" + para
             else:
                 buffer += ("\n" if buffer else "") + para
 
@@ -106,15 +110,21 @@ def chunk_text(pages: list[dict]) -> list[dict]:
     return chunks
 
 
-async def get_cohere_embeddings(texts: list[str], input_type: str = "search_document") -> list[list[float]]:
+async def get_cohere_embeddings(
+    texts: list[str],
+    input_type: str = "search_document",
+    api_key: str = "",
+    model: str = COHERE_EMBED_MODEL,
+) -> list[list[float]]:
     """呼叫 Cohere Embed API，回傳向量列表"""
+    resolved_key = api_key if api_key else COHERE_API_KEY
     url = "https://api.cohere.com/v2/embed"
     headers = {
-        "Authorization": f"Bearer {COHERE_API_KEY}",
+        "Authorization": f"Bearer {resolved_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": COHERE_EMBED_MODEL,
+        "model": model,
         "texts": texts,
         "input_type": input_type,
         "embedding_types": ["float"],
@@ -127,8 +137,9 @@ async def get_cohere_embeddings(texts: list[str], input_type: str = "search_docu
     return data["embeddings"]["float"]
 
 
-async def classify_document(filename: str, summary: str) -> list[str]:
+async def classify_document(filename: str, summary: str, llm_model: str = GEMINI_MODEL, llm_api_key: str = "") -> list[str]:
     """用 Gemini 判斷文件應進入哪些 workspace tags"""
+    resolved_key = llm_api_key if llm_api_key else GEMINI_API_KEY
     prompt = f"""分析以下文件的檔名與內容摘要，判斷應該分類到哪些知識庫。
 只回傳 JSON 陣列，不要其他文字、說明或 markdown 符號。
 
@@ -146,7 +157,7 @@ GENERAL（無法明確分類者）
 內容摘要（前500字）：{summary[:500]}
 代碼："""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{llm_model}:generateContent?key={resolved_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -222,7 +233,12 @@ async def save_doc_index(filename: str, workspace_tags: list[str]) -> int:
     return resp.json()[0]["id"]
 
 
-async def vector_search(query_embedding: list[float], filter_tags: list[str]) -> list[dict]:
+async def vector_search(
+    query_embedding: list[float],
+    filter_tags: list[str],
+    match_count: int = TOP_K,
+    similarity_threshold: float = SIMILARITY_THRESHOLD,
+) -> list[dict]:
     """呼叫 Supabase RPC 做向量搜尋"""
     url = f"{SUPABASE_URL}/rest/v1/rpc/search_chunks"
     headers = {
@@ -234,8 +250,8 @@ async def vector_search(query_embedding: list[float], filter_tags: list[str]) ->
     payload = {
         "query_embedding": query_embedding,
         "filter_tags": filter_tags,
-        "match_count": TOP_K,
-        "similarity_threshold": SIMILARITY_THRESHOLD,
+        "match_count": match_count,
+        "similarity_threshold": similarity_threshold,
     }
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
@@ -244,15 +260,23 @@ async def vector_search(query_embedding: list[float], filter_tags: list[str]) ->
     return resp.json()
 
 
-async def generate_answer(question: str, context_chunks: list[dict]) -> str:
+async def generate_answer(
+    question: str,
+    context_chunks: list[dict],
+    system_prompt: str = "",
+    llm_model: str = GEMINI_MODEL,
+    llm_api_key: str = "",
+    temperature: float = 0.3,
+) -> str:
     """用 Gemini 根據 context 生成答案"""
     if not context_chunks:
         return "目前知識庫中查無相關規定。\n\n建議您：\n• 換個關鍵字再試一次\n• 直接洽詢主管機關確認最新規定"
 
+    resolved_key = llm_api_key if llm_api_key else GEMINI_API_KEY
+    resolved_system = system_prompt if system_prompt else DEFAULT_SYSTEM_PROMPT
+
     context = "\n\n---\n\n".join([c["chunk_text"] for c in context_chunks])
-    prompt = f"""你是一位行政法規助理，請根據以下知識庫內容回答問題。
-請用繁體中文回答，條列重點，並在最後說明資料來源。
-若知識庫內容不足以完整回答，請說明不足之處並建議洽詢主管機關。
+    prompt = f"""{resolved_system}
 
 知識庫內容：
 {context}
@@ -261,10 +285,10 @@ async def generate_answer(question: str, context_chunks: list[dict]) -> str:
 
 回答："""
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{llm_model}:generateContent?key={resolved_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
+        "generationConfig": {"temperature": temperature},
     }
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload)
@@ -280,13 +304,19 @@ async def generate_answer(question: str, context_chunks: list[dict]) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.1.0"}
 
 
 @app.post("/ingest")
 async def ingest(
     file: UploadFile = File(...),
     admin_password: str = Form(...),
+    chunk_size: int = Form(1200),
+    chunk_overlap: int = Form(240),
+    max_embed_length: int = Form(2048),
+    embed_provider: str = Form("cohere"),
+    embed_model: str = Form("embed-multilingual-light-v3.0"),
+    embed_api_key: str = Form(""),
 ):
     """PDF 入庫：解析 → 分類 → 切chunk → 嵌入 → 存 Supabase"""
 
@@ -308,17 +338,22 @@ async def ingest(
     summary_text = " ".join([p["text"] for p in pages[:3]])  # 前3頁作為摘要
     workspace_tags = await classify_document(filename, summary_text)
 
-    # 5. 切 chunk
-    chunks = chunk_text(pages)
+    # 5. 切 chunk（使用傳入的 chunk_size / chunk_overlap）
+    chunks = chunk_text(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     if not chunks:
         raise HTTPException(status_code=422, detail="切 chunk 失敗")
 
     # 6. Cohere 嵌入（批次處理，每批 96 筆）
     all_embeddings = []
     batch_size = 96
-    texts = [c["text"] for c in chunks]
+    texts = [c["text"][:max_embed_length] for c in chunks]
     for i in range(0, len(texts), batch_size):
-        batch_embs = await get_cohere_embeddings(texts[i:i + batch_size], "search_document")
+        batch_embs = await get_cohere_embeddings(
+            texts[i:i + batch_size],
+            "search_document",
+            api_key=embed_api_key,
+            model=embed_model,
+        )
         all_embeddings.extend(batch_embs)
 
     # 7. 寫入 document_index
@@ -340,6 +375,16 @@ class QueryRequest(BaseModel):
     intent: str
     question: str
     session_id: str = "default"
+    system_prompt: str = ""
+    llm_provider: str = "gemini"
+    llm_model: str = "gemini-2.5-flash"
+    llm_api_key: str = ""
+    temperature: float = 0.3
+    embed_provider: str = "cohere"
+    embed_model: str = "embed-multilingual-light-v3.0"
+    embed_api_key: str = ""
+    max_context_snippets: int = 4
+    similarity_threshold: float = 0.25
 
 
 @app.post("/query")
@@ -352,14 +397,31 @@ async def query(req: QueryRequest):
     filter_tags = [tag] if tag != "GENERAL" else list(set(INTENT_TAG_MAP.values()) - {"GENERAL"}) + ["GENERAL"]
 
     # 2. 問題向量化
-    query_embeddings = await get_cohere_embeddings([req.question], "search_query")
+    query_embeddings = await get_cohere_embeddings(
+        [req.question],
+        "search_query",
+        api_key=req.embed_api_key,
+        model=req.embed_model,
+    )
     query_embedding = query_embeddings[0]
 
     # 3. 向量搜尋
-    results = await vector_search(query_embedding, filter_tags)
+    results = await vector_search(
+        query_embedding,
+        filter_tags,
+        match_count=req.max_context_snippets,
+        similarity_threshold=req.similarity_threshold,
+    )
 
     # 4. Gemini 生成答案
-    answer = await generate_answer(req.question, results)
+    answer = await generate_answer(
+        req.question,
+        results,
+        system_prompt=req.system_prompt,
+        llm_model=req.llm_model,
+        llm_api_key=req.llm_api_key,
+        temperature=req.temperature,
+    )
 
     return {
         "answer": answer,
