@@ -16,7 +16,12 @@ from typing import Optional
 
 # ── PDF 解析 ──────────────────────────────────────────────
 import pdfplumber
-from mistralai import Mistral
+try:
+    from mistralai import Mistral
+    MISTRAL_AVAILABLE = True
+except ImportError:
+    MISTRAL_AVAILABLE = False
+    Mistral = None
 
 app = FastAPI(title="KB Service", version="2.1.0")
 app.add_middleware(
@@ -362,6 +367,8 @@ async def ingest(
     total_text_len = sum(len(p["text"]) for p in pages)
 
     if total_text_len < 100:
+        if not MISTRAL_AVAILABLE:
+            raise HTTPException(status_code=500, detail="mistralai 套件未正確安裝，請聯絡管理員")
         if not MISTRAL_API_KEY:
             raise HTTPException(status_code=400, detail="掃描版 PDF 需要設定 MISTRAL_API_KEY 環境變數")
         pages = mistral_ocr_from_pdf(pdf_bytes, filename)
