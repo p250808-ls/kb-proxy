@@ -373,6 +373,65 @@ async def process_pdf_background(
 # API 端點
 # ════════════════════════════════════════════════════════════
 
+
+async def process_text_background(
+    doc_id: int,
+    text: str,
+    filename: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    max_embed_length: int,
+    embed_model: str,
+    embed_api_key: str,
+):
+    """n8n OCR workflow 用：text 已提取完畢，跳過 pdfplumber 直接處理"""
+    try:
+        await update_job_status(doc_id, status="processing", progress=30)
+        pages = [{"page": 1, "text": text}]
+        workspace_tags = await classify_document(filename, text[:500])
+
+        await update_job_status(doc_id, status="processing", progress=50)
+        chunks = chunk_text(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+        await update_job_status(doc_id, status="processing", progress=70)
+        all_embeddings = []
+        batch_size = 96
+        texts_list = [c["text"][:max_embed_length] for c in chunks]
+        try:
+            for i in range(0, len(texts_list), batch_size):
+                batch_embs = await get_cohere_embeddings(
+                    texts_list[i:i + batch_size],
+                    "search_document",
+                    api_key=embed_api_key,
+                    model=embed_model,
+                )
+                all_embeddings.extend(batch_embs)
+        except Exception:
+            await update_job_status(
+                doc_id, status="failed",
+                error_message="向量嵌入失敗（Cohere API 錯誤），請稍後重試"
+            )
+            return
+
+        await update_job_status(doc_id, status="processing", progress=90)
+        await save_chunks_to_supabase(doc_id, chunks, all_embeddings, workspace_tags)
+
+        await update_job_status(
+            doc_id,
+            status="done",
+            progress=100,
+            chunks_count=len(chunks),
+            target_workspaces=workspace_tags,
+            primary_workspace=workspace_tags[0] if workspace_tags else "GENERAL",
+        )
+
+    except Exception as e:
+        await update_job_status(
+            doc_id, status="failed",
+            error_message=f"處理失敗：{str(e)}"
+        )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.2.0"}
@@ -418,6 +477,48 @@ async def ingest(
     background_tasks.add_task(
         process_pdf_background,
         doc_id, pdf_bytes, filename,
+        chunk_size, chunk_overlap, max_embed_length,
+        embed_model, embed_api_key,
+    )
+
+    return {
+        "job_id": doc_id,
+        "status": "queued",
+        "message": "文件已排入處理佇列，請稍後查詢進度",
+    }
+
+
+
+@app.post("/ingest-text")
+async def ingest_text(
+    background_tasks: BackgroundTasks,
+    text: str = Form(...),
+    filename: str = Form(...),
+    admin_password: str = Form(...),
+    chunk_size: int = Form(1500),
+    chunk_overlap: int = Form(200),
+    max_embed_length: int = Form(2048),
+    embed_provider: str = Form("cohere"),
+    embed_model: str = Form("embed-multilingual-light-v3.0"),
+    embed_api_key: str = Form(""),
+):
+    """n8n OCR workflow 入庫：text 已由 Mistral OCR 提取，跳過 PDF 解析"""
+
+    correct_pwd = os.environ.get("ADMIN_UPLOAD_PASSWORD", "")
+    if admin_password != correct_pwd:
+        raise HTTPException(status_code=403, detail="密碼錯誤")
+
+    if not text or not text.strip():
+        raise HTTPException(status_code=422, detail="text 參數不可為空")
+
+    if not filename:
+        raise HTTPException(status_code=422, detail="filename 參數不可為空")
+
+    doc_id = await save_doc_index_queued(filename)
+
+    background_tasks.add_task(
+        process_text_background,
+        doc_id, text.strip(), filename,
         chunk_size, chunk_overlap, max_embed_length,
         embed_model, embed_api_key,
     )
