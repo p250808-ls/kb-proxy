@@ -16,12 +16,6 @@ from typing import Optional
 
 # ── PDF 解析 ──────────────────────────────────────────────
 import pdfplumber
-try:
-    from mistralai import Mistral
-    MISTRAL_AVAILABLE = True
-except ImportError:
-    MISTRAL_AVAILABLE = False
-    Mistral = None
 
 app = FastAPI(title="KB Service", version="2.1.0")
 app.add_middleware(
@@ -36,7 +30,6 @@ SUPABASE_URL         = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 COHERE_API_KEY       = os.environ.get("COHERE_API_KEY", "")
 GEMINI_API_KEY       = os.environ.get("GEMINI_API_KEY", "")
-MISTRAL_API_KEY      = os.environ.get("MISTRAL_API_KEY", "")
 
 COHERE_EMBED_MODEL   = "embed-multilingual-light-v3.0"
 GEMINI_MODEL         = "gemini-2.5-flash"
@@ -73,30 +66,6 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> list[dict]:
             if text.strip():
                 pages.append({"page": i + 1, "text": text.strip()})
     return pages
-
-
-def mistral_ocr_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]:
-    """使用 Mistral OCR 解析掃描版 PDF，回傳 [{page, text}]"""
-    try:
-        client = Mistral(api_key=MISTRAL_API_KEY)
-        uploaded = client.files.upload(
-            file={"file_name": filename, "content": pdf_bytes},
-            purpose="ocr",
-        )
-        signed_url = client.files.get_signed_url(file_id=uploaded.id)
-        ocr_response = client.ocr.process(
-            model="mistral-ocr-latest",
-            document={"type": "document_url", "document_url": signed_url.url},
-        )
-        pages = [
-            {"page": i + 1, "text": p.markdown}
-            for i, p in enumerate(ocr_response.pages)
-            if p.markdown and p.markdown.strip()
-        ]
-        client.files.delete(file_id=uploaded.id)
-        return pages
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Mistral OCR 失敗：{str(e)}")
 
 
 def chunk_text(pages: list[dict], chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHUNK_OVERLAP) -> list[dict]:
@@ -360,21 +329,8 @@ async def ingest(
     pdf_bytes = await file.read()
     filename = file.filename or "unknown.pdf"
 
-    # 3. 提取文字（優先 pdfplumber，掃描版改用 Mistral OCR）
-    ocr_used = False
-    parse_method = "pdfplumber"
+    # 3. 提取文字
     pages = extract_text_from_pdf(pdf_bytes)
-    total_text_len = sum(len(p["text"]) for p in pages)
-
-    if total_text_len < 100:
-        if not MISTRAL_AVAILABLE:
-            raise HTTPException(status_code=500, detail="mistralai 套件未正確安裝，請聯絡管理員")
-        if not MISTRAL_API_KEY:
-            raise HTTPException(status_code=400, detail="掃描版 PDF 需要設定 MISTRAL_API_KEY 環境變數")
-        pages = mistral_ocr_from_pdf(pdf_bytes, filename)
-        ocr_used = True
-        parse_method = "mistral-ocr"
-
     if not pages:
         raise HTTPException(status_code=422, detail="無法從 PDF 提取文字，請確認非純掃描檔")
 
@@ -412,8 +368,6 @@ async def ingest(
         "workspace_tags": workspace_tags,
         "chunks_count": len(chunks),
         "doc_id": doc_id,
-        "ocr_used": ocr_used,
-        "parse_method": parse_method,
     }
 
 
